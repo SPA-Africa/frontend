@@ -1,0 +1,113 @@
+@import "tailwindcss";
+
+/* dark mode follows the data-theme attribute set by the theme toggle */
+@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *));
+
+/* ---------- runtime colour tokens (swap per theme) ---------- */
+:root {
+  --bg: #ffffff;
+  --surface: #f7f5f2;
+  --surface-2: #efebe6;
+  --ink: #1a120c;
+  --muted: #5e544c;
+  --subtle: #8a7f75;
+  --line: #ebe6e0;
+  --nav: rgb(255 255 255 / 0.86);
+  --canvas: #f8f7f5; /* behind portal cards; public pages stay pure white */
+  color-scheme: light;
+}
+[data-theme="dark"] {
+  --bg: #15110e;
+  --surface: #211b17;
+  --surface-2: #2a231e;
+  --ink: #f4eee8;
+  --muted: #b3a89e;
+  --subtle: #8c8178;
+  --line: #322a24;
+  --nav: rgb(21 17 14 / 0.86);
+  --canvas: #110e0b;
+  color-scheme: dark;
+}
+
+/* accessibility menu (SRS NFR-UX.2) */
+html[data-text="lg"] { font-size: 112.5%; }
+html[data-text="xl"] { font-size: 125%; }
+html[data-contrast="high"] { --muted: #3a312a; --subtle: #4f453d; --line: #b9b0a6; }
+html[data-contrast="high"][data-theme="dark"] { --muted: #e2d9cf; --subtle: #cfc4b9; --line: #6b6058; }
+html[data-motion="reduce"] *, html[data-motion="reduce"] *::before, html[data-motion="reduce"] *::after { animation: none !important; transition-duration: .001ms !important; }
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+  --color-line: var(--line);
+  --color-nav: var(--nav);
+  --color-canvas: var(--canvas);
+
+  /* one colour per pillar, all from the logo's red and gold family plus a field green */
+  --color-p-technology: #cb3302;
+  --color-p-education: #d98e12;
+  --color-p-leadership: #8a2a0b;
+  --color-p-young_startups: #e0702a;
+  --color-p-agriculture: #5c7f2b;
+
+  /* brand colours sampled from the logo */
+  --color-brand: #cb3302;
+  --color-brand-dark: #a82a02;
+  --color-brand-light: #f9e6dc;
+  --color-gold: #eba12c;
+  --color-gold-light: #fcefd6;
+
+  /* status */
+  --color-ok: #2f7d4f;
+  --color-ok-light: #e3f1e8;
+  --color-info: #2f5d86;
+  --color-info-light: #e2ecf5;
+
+  --font-display: var(--font-bricolage), system-ui, sans-serif;
+  --font-sans: var(--font-manrope), system-ui, sans-serif;
+
+  --radius-card: 20px;
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@layer base {
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+  body {
+    @apply bg-bg text-ink font-sans antialiased;
+    transition: background-color .35s, color .35s;
+  }
+  h1, h2, h3, h4 { @apply font-display tracking-tight; }
+  ::selection { @apply bg-brand text-white; }
+  :focus-visible { @apply outline-2 outline-offset-2 outline-brand rounded-md; }
+  /* single-column grids must be able to shrink on phones; grid-cols-* utilities override this */
+  .grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---------- small motion helpers ---------- */
+@layer utilities {
+  .reveal { opacity: 0; transform: translateY(24px); transition: opacity .8s var(--ease-out-soft), transform .8s var(--ease-out-soft); }
+  .reveal.is-in { opacity: 1; transform: none; }
+  .band-track { animation: band 45s linear infinite; }
+  .orbit { animation: orbit 14s linear infinite; }
+  .fade-in { animation: fade-in .5s var(--ease-out-soft) both; }
+}
+@keyframes band { to { transform: translateX(-50%); } }
+@keyframes orbit { to { transform: rotate(360deg); } }
+@keyframes fade-in { from { opacity: 0; transform: translateY(8px); } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition-duration: .001ms !important; }
+  .reveal { opacity: 1; transform: none; }
+  html { scroll-behavior: auto; }
+}
+
+/* printable certificates, invoices and reports: drop the app chrome */
+@media print {
+  [data-print-hide] { display: none !important; }
+  body { background: #fff !important; color: #000; }
+  main { padding: 0 !important; }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "SHAPE Potential Africa",
+  "short_name": "SHAPE",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#cb3302",
+  "icons": [{ "src": "/logo.png", "sizes": "3722x1364", "type": "image/png" }]
+}

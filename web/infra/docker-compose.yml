@@ -1,0 +1,75 @@
+# Local full stack (SRS 2.4). Run from this folder:  docker compose up --build
+#
+# web       Next.js frontend in live mode            http://localhost:3000
+# gateway   Nginx API gateway                        http://localhost:8080
+# core-svc  NestJS core microservice   <- backend team: point `build.context` at your repo
+# ai-svc    FastAPI analytics service  <- backend team: point `build.context` at your repo
+# postgres, redis, minio                 infrastructure (MinIO console on http://localhost:9001)
+
+services:
+  web:
+    build: { context: .., dockerfile: Dockerfile }
+    environment:
+      NEXT_PUBLIC_API_MODE: live
+      API_GATEWAY_INTERNAL_URL: http://gateway:8080
+    ports: ["3000:3000"]
+    depends_on: [gateway]
+
+  gateway:
+    image: nginx:1.27-alpine
+    volumes: ["./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro"]
+    ports: ["8080:8080"]
+    depends_on: [core-svc, ai-svc]
+
+  core-svc:
+    build: { context: ../../backend/core-svc }
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://spa:spa@postgres:5432/spa_platform
+      REDIS_URL: redis://redis:6379
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_ENDPOINT: http://localhost:9000
+      MINIO_ACCESS_KEY: spa
+      MINIO_SECRET_KEY: spa-secret-change-me
+      JWT_SECRET: change-me
+      ACCESS_TOKEN_TTL: 15m
+      CORS_ORIGIN: http://localhost:3000
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+      minio: { condition: service_started }
+
+  ai-svc:
+    build: { context: ../../backend/ai-svc }
+    environment:
+      PORT: 8000
+      DATABASE_URL: postgresql://spa:spa@postgres:5432/spa_platform
+      DATABASE_REPLICA_URL: postgresql://spa:spa@postgres:5432/spa_platform
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: change-me
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: spa, POSTGRES_PASSWORD: spa, POSTGRES_DB: spa_platform }
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U spa"], interval: 5s, retries: 10 }
+    ports: ["5432:5432"]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment: { MINIO_ROOT_USER: spa, MINIO_ROOT_PASSWORD: spa-secret-change-me }
+    volumes: ["miniodata:/data"]
+    ports: ["9000:9000", "9001:9001"]
+
+volumes:
+  pgdata:
+  miniodata:
