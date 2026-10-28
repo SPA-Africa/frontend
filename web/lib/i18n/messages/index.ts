@@ -7,5 +7,7 @@ import { org } from './org';
 import { internal } from './internal';
 import { admin } from './admin';
 import { site } from './site';
+import { aiLearning } from './ai-learning';
+import { aiAssist } from './ai-assist';
 
-export const messages: Messages = { ...common, ...nav, ...publicMessages, ...learner, ...org, ...internal, ...admin, ...site };
+export const messages: Messages = { ...common, ...nav, ...publicMessages, ...learner, ...org, ...internal, ...admin, ...site, ...aiLearning, ...aiAssist };

@@ -1,6 +1,6 @@
 import {
   Award, BarChart3, BookOpen, Building2, CalendarDays, ClipboardCheck, ClipboardList, FileText, Flag, Gauge,
-  GraduationCap, Home, Landmark, LayoutDashboard, ListChecks, Milestone, Package, Receipt,
+  GraduationCap, Home, Landmark, LayoutDashboard, ListChecks, MessageSquareText, Milestone, Package, Receipt,
   Rocket, ScrollText, Settings, ShieldCheck, Sprout, Store, Target, User, Users,
 } from 'lucide-react';
 import type { Role } from '@/lib/types';
@@ -46,6 +46,7 @@ export const portalNav: Record<Role, { base: string; title: string; groups: NavG
       { items: [
         { href: '/console', label: 'nav.overview', icon: LayoutDashboard },
         { href: '/console/courses', label: 'nav.courses', icon: BookOpen },
+        { href: '/console/reviews', label: 'nav.answerReviews', icon: MessageSquareText },
         { href: '/console/learners', label: 'nav.learners', icon: Users },
         { href: '/console/milestones', label: 'nav.milestones', icon: Milestone },
         { href: '/console/kpis', label: 'nav.kpis', icon: Target },

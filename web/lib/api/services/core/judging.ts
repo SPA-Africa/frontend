@@ -1,11 +1,14 @@
 // core-svc / judging: blind grading terminal (SRS FR-B2.1 to FR-B2.7)
 //
 // Judges only ever see an anonymous entry code. Business name, team, founder names, photos,
-// contact details and original file names are stripped by ai-svc before routing (FR-A3.7, NFR-SEC.9).
+// contact details and original file names never reach them (FR-A3.7, NFR-SEC.9), and documents are
+// only served as anonymised copies that core-svc prepares in the background after submission (FR-B2.2).
 
 import { defineEndpoint } from '../../define';
 import { nowIso } from '../../mock-db';
 import { db } from '../../mock/tables';
+import { copyStatus } from '../../mock/assist-tables';
+import { demoPdf } from '../../mock/demo-pdf';
 import { appendAudit, consoleDb, type JudgeDraft } from '../../mock/console-tables';
 import { recomputeAggregates, rerouteEntry, weightedTotal } from '../ai/evaluation';
 import { rubric as seedRubric } from '../../../mock/data';
@@ -35,6 +38,8 @@ export interface EntryDocument {
   name: string;
   sizeMb: number;
   scan: 'pending' | 'clean';
+  /** the anonymised copy: ready to view, still being prepared, or not available (judge on the summary) */
+  status: 'ready' | 'pending' | 'unavailable';
 }
 
 export interface GradingEntry {
@@ -100,6 +105,38 @@ function assigned(code: string, fail: (s: number, c: string, m: string) => never
   return db.judgeQueue.get().find(e => e.code === code) ?? fail(404, 'not_assigned', 'This entry is not in your queue, or you have been recused from it');
 }
 
+/** Demo entries without stored files get both documents */
+const DEMO_FILES = [{ kind: 'business_plan' as const, sizeMb: 2.1, scan: 'clean' as const }, { kind: 'pitch_deck' as const, sizeMb: 5.4, scan: 'clean' as const }];
+
+/** Current clean files only, as the backend returns them, each with the state of its anonymised copy */
+const documentsOf = (code: string): EntryDocument[] => {
+  const files = db.pitches.get().find(p => p.code === code)?.files;
+  return (files?.length ? files : DEMO_FILES).filter(f => f.scan === 'clean')
+    .map(f => ({ kind: f.kind, name: `${code}-${f.kind.replace('_', '-')}.pdf`, sizeMb: f.sizeMb, scan: f.scan, status: copyStatus(code, f.kind) }));
+};
+
+/** Mock mode: a stand-in anonymised copy built in the browser, one object URL per document */
+const demoCopies = new Map<string, string>();
+function demoCopyUrl(e: { code: string; sector: string; summary: string; fundingRequested: number }, kind: EntryDocument['kind']) {
+  if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return `/media/redacted/${e.code}/${kind}.pdf`;
+  const key = `${e.code}:${kind}`;
+  let url = demoCopies.get(key);
+  if (!url) {
+    const deck = kind === 'pitch_deck';
+    const h = (text: string) => ({ text, size: 13, bold: true, gapAfter: 4 });
+    url = URL.createObjectURL(demoPdf([
+      { text: `Anonymised copy - ${e.code} - ${deck ? 'Pitch deck' : 'Business plan'}`, size: 16, bold: true, gapAfter: 4 },
+      { text: 'Prepared for blind judging. Names, contact details and other identifying details are replaced with [REDACTED]. Pictures, logos and the original layout are not included.', size: 9.5, gapAfter: 16 },
+      h(deck ? 'Slide 1: The problem and our answer' : 'Summary'), { text: e.summary },
+      h(deck ? 'Slide 2: The ask' : 'Funding requested'), { text: `USD ${e.fundingRequested.toLocaleString('en-US')} to grow [REDACTED] in the ${e.sector.toLowerCase()} sector.` },
+      h(deck ? 'Slide 3: Team' : 'Team and contact'), { text: '[REDACTED] (Founder) and [REDACTED] (Operations). Contact: [REDACTED].' },
+      { text: 'Demo copy. In the live system this is the anonymised text of the document the founder uploaded.', size: 9, gapAfter: 0 },
+    ]));
+    demoCopies.set(key, url);
+  }
+  return url;
+}
+
 function checkScores(scores: Record<string, number>, fail: (s: number, c: string, m: string) => never, complete: boolean) {
   const ids = new Set(seedRubric.map(r => r.id));
   Object.entries(scores).forEach(([k, v]) => {
@@ -132,14 +169,12 @@ export const getEntry = defineEndpoint<GradingEntry, { params: { code: string } 
   id: 'judging.entries.get', service: 'core', method: 'GET', path: '/judging/entries/:code',
   roles: ['judge_mentor'], summary: 'Anonymised entry for grading by its code, with documents and the caller\'s draft or submitted score',
   srs: ['FR-B2.2', 'FR-B2.3', 'NFR-SEC.9'], response: 'GradingEntry',
-  notes: '404 not_assigned unless the entry is routed to the caller and not recused. Response must contain no personal data: no names, team, photos, emails, phones or original file names (NFR-SEC.9).',
+  notes: '404 not_assigned unless the entry is routed to the caller and not recused. Response must contain no personal data: no names, team, photos, emails, phones or original file names (NFR-SEC.9). `documents` lists the entry\'s current files that passed the virus scan (none for an entry without files), each with the `status` of its anonymised copy: ready, pending (being prepared) or unavailable (AI turned off, three failed attempts, or the original is missing).',
 }, ({ args, user, fail }) => {
   const e = assigned(args.params.code, fail);
   const jid = judgeIdOf(user);
   const c = cycleOf(e.cycleId);
-  const files = db.pitches.get().find(p => p.code === e.code)?.files;
-  const documents: EntryDocument[] = (files?.length ? files : [{ kind: 'business_plan' as const, sizeMb: 2.1, scan: 'clean' as const }, { kind: 'pitch_deck' as const, sizeMb: 5.4, scan: 'clean' as const }])
-    .map(f => ({ kind: f.kind, name: `${e.code}-${f.kind.replace('_', '-')}.pdf`, sizeMb: f.sizeMb, scan: f.scan }));
+  const documents = documentsOf(e.code);
   const submitted = myScoreOf(jid, e.code);
   return {
     code: e.code, cycle: { id: e.cycleId, name: c?.name ?? e.cycleId, region: c?.region ?? '' }, sector: e.sector, summary: e.summary,
@@ -150,12 +185,15 @@ export const getEntry = defineEndpoint<GradingEntry, { params: { code: string } 
 
 export const getDocumentLink = defineEndpoint<DocumentLink, { params: { code: string; kind: EntryDocument['kind'] } }>({
   id: 'judging.documents.link', service: 'core', method: 'GET', path: '/judging/entries/:code/documents/:kind',
-  roles: ['judge_mentor'], summary: 'Short-lived pre-signed MinIO link to a redacted entry document',
-  srs: ['FR-B2.3', 'NFR-SEC.9'], response: 'DocumentLink',
-  notes: 'Serve the redacted copy only (names, logos and contact details removed). URL expires after 5 minutes. 409 scan_pending while the virus scan has not passed.',
+  roles: ['judge_mentor'], summary: 'Short-lived pre-signed link to the anonymised copy of an entry document',
+  srs: ['FR-B2.2', 'FR-B2.3', 'NFR-SEC.9'], response: 'DocumentLink',
+  notes: 'Serves the anonymised copy only, never the upload: a PDF rendered after submission with names, contact details, links and other identifying details replaced by [REDACTED] (Claude, then a deterministic pass over the entry\'s known names). Opened inline in the page viewer; the URL expires after 5 minutes. 409 redaction_pending while the copy is being prepared; 409 redaction_unavailable when there is none.',
 }, ({ args, fail }) => {
-  assigned(args.params.code, fail);
-  return { url: `/media/redacted/${args.params.code}/${args.params.kind}.pdf`, expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(), redacted: true };
+  const e = assigned(args.params.code, fail);
+  const doc = documentsOf(e.code).find(d => d.kind === args.params.kind);
+  if (doc?.status === 'pending') fail(409, 'redaction_pending', 'The anonymised copy is still being prepared. Try again in a minute.');
+  if (doc?.status !== 'ready') fail(409, 'redaction_unavailable', 'An anonymised copy of this document is not available');
+  return { url: demoCopyUrl(e, args.params.kind), expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(), redacted: true };
 });
 
 export const getRubric = defineEndpoint<RubricCriterion[], { params: { cycleId: string } }>({

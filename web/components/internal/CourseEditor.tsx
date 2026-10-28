@@ -1,19 +1,24 @@
 'use client';
 
-// Course authoring: details, outcomes, modules and lessons, and a quiz builder for quiz lessons.
+// Course authoring: details, outcomes, modules and lessons, a quiz builder for quiz lessons and a text
+// editor for reading lessons. The writing assistant drafts the outline, reading text and quiz
+// questions with AI; drafts land in the editor and are only stored when the author saves.
 // Reads and writes only through the authoring service. Saving keeps a draft; publishing makes the
 // course visible to learners (course.published) through the shared courses table.
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { ArrowDown, ArrowUp, CheckCircle2, ChevronDown, ChevronUp, EyeOff, FileQuestion, Plus, Send, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, BookOpenText, CheckCircle2, ChevronDown, ChevronUp, EyeOff, FileQuestion, Loader2, Plus, Send, Sparkles, Trash2 } from 'lucide-react';
 import { Button, Checkbox, Field, Input, Select, Textarea } from '@/components/ui';
 import { useToast } from '@/components/ui/client';
 import { ErrorState, PageHead, Panel, Skeleton, SkeletonPanel, StatusPill } from '@/components/dash';
 import { ConfirmDialog, FormError, PillarScope } from '@/components/console/ConsoleKit';
 import { errorMessage, useApi } from '@/lib/api/hooks';
 import { authoring } from '@/lib/api/services';
-import type { AuthoringContext, AuthoringCourse, AuthoringLesson, AuthoringModule, CourseDraftInput, CourseLanguage, QuizDefinition } from '@/lib/api/services/core/authoring';
+import type {
+  AssistRequest, AuthoringContext, AuthoringCourse, AuthoringLesson, AuthoringModule, AuthoringQuizQuestion, CourseDraftInput, CourseLanguage,
+  QuizDefinition, ReadingContent,
+} from '@/lib/api/services/core/authoring';
 import { useT } from '@/lib/i18n';
 import type { Course, LessonType, QuizQuestion } from '@/lib/types';
 import { cx, date, num } from '@/lib/format';
@@ -21,12 +26,20 @@ import { cx, date, num } from '@/lib/format';
 const LESSON_TYPES: LessonType[] = ['video', 'reading', 'pdf', 'quiz'];
 const Q_TYPES: QuizQuestion['type'][] = ['single', 'multiple', 'true_false', 'short'];
 const LEVELS: Course['level'][] = ['Beginner', 'Intermediate', 'Advanced'];
+const AI_COUNTS = [3, 5, 10];
 
 let seq = 0;
 const uid = (p: string) => `${p}-${Date.now().toString(36)}${++seq}`;
 
-const blankQuestion = (): QuizQuestion => ({ id: uid('q'), type: 'single', prompt: '', options: ['', ''], answer: [0] });
+const blankQuestion = (): AuthoringQuizQuestion => ({ id: uid('q'), type: 'single', prompt: '', options: ['', ''], answer: [0] });
 const newQuiz = (ctx: AuthoringContext): QuizDefinition => ({ ...ctx.quizDefaults, questions: [blankQuestion()] });
+
+/** What the writing assistant needs to know about the course */
+const assistCourse = (d: CourseDraftInput): AssistRequest['course'] => ({
+  title: d.title.trim(), summary: d.summary.trim(), outcomes: d.outcomes.map(o => o.trim()).filter(Boolean), level: d.level, languages: d.languages, program: d.program,
+});
+
+const AiIcon = ({ busy }: { busy: boolean }) => (busy ? <Loader2 size={15} className="animate-spin" aria-hidden /> : <Sparkles size={15} aria-hidden />);
 
 const blankDraft = (ctx: AuthoringContext): CourseDraftInput => ({
   title: '', program: ctx.programmes[0], level: 'Beginner', hours: 6, languages: ['English'], summary: '', outcomes: [''],
@@ -68,7 +81,10 @@ export function CourseEditor({ courseId }: { courseId?: string }) {
   const [d, setD] = useState<CourseDraftInput | null>(null);
   const [saved, setSaved] = useState('');
   const [openQuiz, setOpenQuiz] = useState<string | null>(null);
-  const [confirm, setConfirm] = useState<null | 'publish' | 'unpublish'>(null);
+  const [openReading, setOpenReading] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<null | 'publish' | 'unpublish' | 'outline'>(null);
+  const [outlineBusy, setOutlineBusy] = useState(false);
+  const [outlineError, setOutlineError] = useState<string | null>(null);
   const [problems, setProblems] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -109,6 +125,36 @@ export function CourseEditor({ courseId }: { courseId?: string }) {
   const setModule = (mi: number, fn: (m: AuthoringModule) => AuthoringModule) => setModules(ms => ms.map((m, i) => (i === mi ? fn(m) : m)));
   const setLesson = (mi: number, li: number, fn: (l: AuthoringLesson) => AuthoringLesson) =>
     setModule(mi, m => ({ ...m, lessons: m.lessons.map((l, i) => (i === li ? fn(l) : l)) }));
+  // AI drafts arrive after a few seconds: find the lesson by id in case the outline moved meanwhile
+  const setLessonById = (id: string, fn: (l: AuthoringLesson) => AuthoringLesson) =>
+    setModules(ms => ms.map(m => ({ ...m, lessons: m.lessons.map(l => (l.id === id ? fn(l) : l)) })));
+
+  const hasOutline = d.modules.some(m => m.title.trim() || m.lessons.some(l => l.title.trim()));
+  const askOutline = () => {
+    setOutlineError(null);
+    if (d.title.trim().length < 5) { setOutlineError(t('ai.authoring.needTitle')); return; }
+    if (hasOutline) setConfirm('outline'); else draftOutline();
+  };
+  const draftOutline = async () => {
+    setOutlineBusy(true);
+    try {
+      const out = await authoring.assist({ body: { task: 'outline', course: assistCourse(d) } });
+      if (out.task === 'outline') {
+        setModules(() => out.modules.map(m => ({
+          id: uid('m'), title: m.title,
+          lessons: m.lessons.map(l => ({ id: uid('l'), title: l.title, type: l.type, minutes: l.minutes, ...(l.type === 'quiz' ? { quiz: newQuiz(ctx) } : {}) })),
+        })));
+        setOpenQuiz(null);
+        setOpenReading(null);
+        toast(t('ai.authoring.outlineDone'));
+      }
+    } catch (e) {
+      setOutlineError(errorMessage(e));
+    } finally {
+      setOutlineBusy(false);
+      setConfirm(null);
+    }
+  };
 
   const save = async (): Promise<AuthoringCourse | null> => {
     setError(null);
@@ -234,6 +280,13 @@ export function CourseEditor({ courseId }: { courseId?: string }) {
 
           <Panel title={t('console.editor.modules')}
             action={<span className="text-sm text-muted tabular-nums">{t('console.editor.structure', { modules: d.modules.length, lessons: lessonCount, minutes })}</span>}>
+            <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-dashed border-line p-4 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-muted">{t('ai.authoring.outlineHint')}</p>
+              <Button variant="ghost" size="sm" className="shrink-0" onClick={askOutline} disabled={outlineBusy || busy} aria-busy={outlineBusy}>
+                <AiIcon busy={outlineBusy} /> {outlineBusy ? t('ai.authoring.drafting') : t('ai.authoring.outline')}
+              </Button>
+            </div>
+            {outlineError && <div className="mb-5"><FormError message={outlineError} /></div>}
             <ol className="flex flex-col gap-5">
               {d.modules.map((m, mi) => (
                 <li key={m.id} className="rounded-2xl border border-line bg-surface p-4 sm:p-5">
@@ -285,7 +338,28 @@ export function CourseEditor({ courseId }: { courseId?: string }) {
                               {t('console.quiz.summary', { n: l.quiz.questions.length, pass: l.quiz.passMark })}
                               {openQuiz === l.id ? <ChevronUp size={15} aria-hidden /> : <ChevronDown size={15} aria-hidden />}
                             </button>
-                            {openQuiz === l.id && <QuizBuilder quiz={l.quiz} onChange={quiz => setLesson(mi, li, x => ({ ...x, quiz }))} />}
+                            {openQuiz === l.id && (
+                              <QuizBuilder quiz={l.quiz} lesson={l} course={assistCourse(d)} onToast={toast}
+                                onChange={quiz => setLesson(mi, li, x => ({ ...x, quiz }))}
+                                onAppend={qs => setLessonById(l.id, x => (x.quiz ? { ...x, quiz: { ...x.quiz, questions: [...x.quiz.questions.filter(q => q.prompt.trim()), ...qs] } } : x))} />
+                            )}
+                          </div>
+                        )}
+                        {l.type === 'reading' && (
+                          <div className="mt-3">
+                            <button type="button" onClick={() => setOpenReading(openReading === l.id ? null : l.id)} aria-expanded={openReading === l.id}
+                              className="inline-flex items-center gap-2 text-sm font-semibold text-brand hover:text-brand-dark">
+                              <BookOpenText size={16} aria-hidden />
+                              {l.content && (l.content.intro.trim() || l.content.sections.length)
+                                ? t('ai.authoring.readingSummary', { n: l.content.sections.length })
+                                : t('ai.authoring.readingEmpty')}
+                              {openReading === l.id ? <ChevronUp size={15} aria-hidden /> : <ChevronDown size={15} aria-hidden />}
+                            </button>
+                            {openReading === l.id && (
+                              <ReadingEditor lesson={l} course={assistCourse(d)} onToast={toast}
+                                onChange={content => setLesson(mi, li, x => ({ ...x, content }))}
+                                onDrafted={content => setLessonById(l.id, x => ({ ...x, content }))} />
+                            )}
                           </div>
                         )}
                       </li>
@@ -341,20 +415,54 @@ export function CourseEditor({ courseId }: { courseId?: string }) {
       <ConfirmDialog open={confirm === 'unpublish'} onClose={() => setConfirm(null)} busy={busy} danger title={t('console.editor.unpublishTitle')} confirmLabel={t('console.editor.unpublish')} onConfirm={unpublish}>
         {t('console.editor.unpublishBody', { n: num(course?.enrolled ?? 0) })}
       </ConfirmDialog>
+      <ConfirmDialog open={confirm === 'outline'} onClose={() => setConfirm(null)} busy={outlineBusy} danger title={t('ai.authoring.replaceTitle')}
+        confirmLabel={outlineBusy ? t('ai.authoring.drafting') : t('ai.authoring.replace')} onConfirm={draftOutline}>
+        {t('ai.authoring.replaceBody', { n: d.modules.length })}
+      </ConfirmDialog>
       {toastNode}
     </>
   );
 }
 
-function QuizBuilder({ quiz, onChange }: { quiz: QuizDefinition; onChange: (q: QuizDefinition) => void }) {
+function QuizBuilder({ quiz, lesson, course, onChange, onAppend, onToast }: {
+  quiz: QuizDefinition; lesson: AuthoringLesson; course: AssistRequest['course'];
+  onChange: (q: QuizDefinition) => void; onAppend: (questions: AuthoringQuizQuestion[]) => void; onToast: (message: string) => void;
+}) {
   const t = useT();
-  const setQ = (i: number, fn: (q: QuizQuestion) => QuizQuestion) => onChange({ ...quiz, questions: quiz.questions.map((q, j) => (j === i ? fn(q) : q)) });
+  const setQ = (i: number, fn: (q: AuthoringQuizQuestion) => AuthoringQuizQuestion) => onChange({ ...quiz, questions: quiz.questions.map((q, j) => (j === i ? fn(q) : q)) });
+  const [count, setCount] = useState(5);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
-  const changeType = (q: QuizQuestion, type: QuizQuestion['type']): QuizQuestion => {
-    if (type === 'true_false') return { ...q, type, options: ['True', 'False'], answer: [0] };
+  const changeType = (q: AuthoringQuizQuestion, type: QuizQuestion['type']): AuthoringQuizQuestion => {
+    if (type === 'true_false') return { ...q, type, options: ['True', 'False'], answer: [0], guidance: undefined };
     if (type === 'short') return { ...q, type, options: undefined, answer: undefined };
     const options = q.type === 'true_false' || !q.options ? ['', ''] : q.options;
-    return { ...q, type, options, answer: type === 'single' ? [q.answer?.[0] ?? 0] : q.answer ?? [] };
+    return { ...q, type, options, answer: type === 'single' ? [q.answer?.[0] ?? 0] : q.answer ?? [], guidance: undefined };
+  };
+
+  /** AI questions are added after the ones already written (blank ones are dropped) */
+  const suggest = async () => {
+    setAiError(null);
+    if (course.title.length < 5) { setAiError(t('ai.authoring.needTitle')); return; }
+    if (!lesson.title.trim()) { setAiError(t('ai.authoring.needLessonTitle')); return; }
+    setAiBusy(true);
+    try {
+      const out = await authoring.assist({
+        body: {
+          task: 'quiz', course, lesson: { title: lesson.title.trim(), minutes: lesson.minutes }, count,
+          existing: { questionPrompts: quiz.questions.map(q => q.prompt.trim()).filter(Boolean) },
+        },
+      });
+      if (out.task === 'quiz') {
+        onAppend(out.questions);
+        onToast(t('ai.authoring.questionsDone', { n: out.questions.length }));
+      }
+    } catch (e) {
+      setAiError(errorMessage(e));
+    } finally {
+      setAiBusy(false);
+    }
   };
 
   const ids = useMemo(() => `qz-${Math.random().toString(36).slice(2, 7)}`, []);
@@ -388,7 +496,13 @@ function QuizBuilder({ quiz, onChange }: { quiz: QuizDefinition; onChange: (q: Q
               className="w-full rounded-xl border border-line bg-bg px-3 py-2 text-[15px] text-ink placeholder:text-subtle focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/10" />
 
             {q.type === 'short' ? (
-              <p className="mt-3 text-sm text-muted">{t('console.quiz.shortNote')}</p>
+              <div className="mt-3 flex flex-col gap-3">
+                <p className="text-sm text-muted">{t('console.quiz.shortNote')}</p>
+                <Field label={t('ai.authoring.guidance')} htmlFor={`qg-${q.id}`} hint={t('ai.authoring.guidanceHint')} optional>
+                  <Textarea id={`qg-${q.id}`} className="min-h-20" maxLength={1000} value={q.guidance ?? ''} placeholder={t('ai.authoring.guidancePlaceholder')}
+                    onChange={e => setQ(i, x => ({ ...x, guidance: e.target.value }))} />
+                </Field>
+              </div>
             ) : (
               <fieldset className="mt-3">
                 <legend className="mb-2 text-sm font-semibold text-muted">{q.type === 'multiple' ? t('console.quiz.markAll') : t('console.quiz.markOne')}</legend>
@@ -426,9 +540,128 @@ function QuizBuilder({ quiz, onChange }: { quiz: QuizDefinition; onChange: (q: Q
           </li>
         ))}
       </ol>
-      <Button variant="ghost" size="sm" className="mt-4 bg-bg" onClick={() => onChange({ ...quiz, questions: [...quiz.questions, blankQuestion()] })}>
-        <Plus size={15} /> {t('console.quiz.addQuestion')}
-      </Button>
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <Button variant="ghost" size="sm" className="bg-bg" onClick={() => onChange({ ...quiz, questions: [...quiz.questions, blankQuestion()] })}>
+          <Plus size={15} /> {t('console.quiz.addQuestion')}
+        </Button>
+        <div className="flex items-center gap-2 sm:ml-auto">
+          <label className="sr-only" htmlFor={`${ids}-count`}>{t('ai.authoring.howMany')}</label>
+          <select id={`${ids}-count`} className={cx(smallField, 'w-20')} value={count} onChange={e => setCount(Number(e.target.value))} disabled={aiBusy}>
+            {AI_COUNTS.map(n => <option key={n} value={n}>{n}</option>)}
+          </select>
+          <Button variant="ghost" size="sm" className="bg-bg" onClick={suggest} disabled={aiBusy} aria-busy={aiBusy}>
+            <AiIcon busy={aiBusy} /> {aiBusy ? t('ai.authoring.drafting') : t('ai.authoring.suggestQuestions')}
+          </Button>
+        </div>
+      </div>
+      {aiError && <div className="mt-3"><FormError message={aiError} /></div>}
+      <p className="mt-2 text-xs text-muted">{t('ai.authoring.aiNote')}</p>
+    </div>
+  );
+}
+
+/** Text of a reading lesson: an introduction and sections with a heading, text and an optional list */
+function ReadingEditor({ lesson, course, onChange, onDrafted, onToast }: {
+  lesson: AuthoringLesson; course: AssistRequest['course'];
+  onChange: (content: ReadingContent | null) => void; onDrafted: (content: ReadingContent) => void; onToast: (message: string) => void;
+}) {
+  const t = useT();
+  const content: ReadingContent = lesson.content ?? { intro: '', sections: [] };
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState(false);
+  const ids = useMemo(() => `rd-${Math.random().toString(36).slice(2, 7)}`, []);
+
+  const hasText = !!(content.intro.trim() || content.sections.some(s => s.heading.trim() || s.body?.trim() || s.list?.some(i => i.trim())));
+  type Section = ReadingContent['sections'][number];
+  const setSection = (i: number, fn: (s: Section) => Section) => onChange({ ...content, sections: content.sections.map((s, j) => (j === i ? fn(s) : s)) });
+
+  const ask = () => {
+    setError(null);
+    if (course.title.length < 5) { setError(t('ai.authoring.needTitle')); return; }
+    if (!lesson.title.trim()) { setError(t('ai.authoring.needLessonTitle')); return; }
+    if (hasText) setConfirm(true); else draft();
+  };
+  const draft = async () => {
+    setBusy(true);
+    try {
+      const out = await authoring.assist({ body: { task: 'reading', course, lesson: { title: lesson.title.trim(), minutes: lesson.minutes } } });
+      if (out.task === 'reading') {
+        onDrafted(out.content);
+        onToast(t('ai.authoring.readingDone'));
+      }
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+      setConfirm(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 rounded-xl border border-line bg-surface p-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-sm text-muted">{t('ai.authoring.readingNote')}</p>
+        <Button variant="ghost" size="sm" className="shrink-0 bg-bg" onClick={ask} disabled={busy} aria-busy={busy}>
+          <AiIcon busy={busy} /> {busy ? t('ai.authoring.drafting') : t('ai.authoring.draftReading')}
+        </Button>
+      </div>
+      {error && <div className="mt-3"><FormError message={error} /></div>}
+
+      <div className="mt-4">
+        <Field label={t('ai.authoring.intro')} htmlFor={`${ids}-intro`}>
+          <Textarea id={`${ids}-intro`} className="min-h-20" maxLength={4000} value={content.intro} onChange={e => onChange({ ...content, intro: e.target.value })} />
+        </Field>
+      </div>
+
+      <ol className="mt-4 flex flex-col gap-3">
+        {content.sections.map((s, i) => (
+          <li key={i} className="rounded-xl border border-line bg-bg p-3">
+            <div className="flex items-center gap-2">
+              <span className="shrink-0 font-display text-sm font-bold text-muted">{t('ai.authoring.sectionN', { n: i + 1 })}</span>
+              <label className="sr-only" htmlFor={`${ids}-h${i}`}>{t('ai.authoring.heading')}</label>
+              <input id={`${ids}-h${i}`} className={cx(smallField, 'min-w-0 flex-1 font-semibold')} maxLength={200} value={s.heading} placeholder={t('ai.authoring.heading')}
+                onChange={e => setSection(i, x => ({ ...x, heading: e.target.value }))} />
+              <IconBtn label={t('ai.authoring.removeSection', { n: i + 1 })} danger onClick={() => onChange({ ...content, sections: content.sections.filter((_, j) => j !== i) })}>
+                <Trash2 size={15} />
+              </IconBtn>
+            </div>
+            <label className="sr-only" htmlFor={`${ids}-b${i}`}>{t('ai.authoring.body')}</label>
+            <textarea id={`${ids}-b${i}`} rows={3} maxLength={8000} value={s.body ?? ''} placeholder={t('ai.authoring.body')}
+              onChange={e => setSection(i, x => ({ ...x, body: e.target.value }))}
+              className="mt-2 w-full rounded-xl border border-line bg-bg px-3 py-2 text-[15px] text-ink placeholder:text-subtle focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/10" />
+            {(s.list ?? []).length > 0 && (
+              <ul className="mt-2 flex flex-col gap-2">
+                {(s.list ?? []).map((item, k) => (
+                  <li key={k} className="flex items-center gap-2">
+                    <span aria-hidden className="w-3 shrink-0 text-center text-muted">•</span>
+                    <input className={cx(smallField, 'min-w-0 flex-1')} maxLength={500} value={item} aria-label={t('ai.authoring.itemN', { n: k + 1 })}
+                      onChange={e => setSection(i, x => ({ ...x, list: (x.list ?? []).map((y, j) => (j === k ? e.target.value : y)) }))} />
+                    <IconBtn label={t('ai.authoring.removeItem', { n: k + 1 })} danger onClick={() => setSection(i, x => ({ ...x, list: (x.list ?? []).filter((_, j) => j !== k) }))}>
+                      <Trash2 size={14} />
+                    </IconBtn>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <Button variant="link" size="sm" className="mt-2" onClick={() => setSection(i, x => ({ ...x, list: [...(x.list ?? []), ''] }))}>
+              <Plus size={14} /> {t('ai.authoring.addItem')}
+            </Button>
+          </li>
+        ))}
+      </ol>
+      <div className="mt-3 flex flex-wrap items-center gap-3">
+        <Button variant="ghost" size="sm" className="bg-bg" onClick={() => onChange({ ...content, sections: [...content.sections, { heading: '', body: '' }] })}>
+          <Plus size={15} /> {t('ai.authoring.addSection')}
+        </Button>
+        {hasText && <Button variant="link" size="sm" onClick={() => onChange(null)}>{t('ai.authoring.clearReading')}</Button>}
+      </div>
+      <p className="mt-2 text-xs text-muted">{t('ai.authoring.aiNote')}</p>
+
+      <ConfirmDialog open={confirm} onClose={() => setConfirm(false)} busy={busy} danger title={t('ai.authoring.replaceReadingTitle')}
+        confirmLabel={busy ? t('ai.authoring.drafting') : t('ai.authoring.replace')} onConfirm={draft}>
+        {t('ai.authoring.replaceReadingBody', { title: lesson.title })}
+      </ConfirmDialog>
     </div>
   );
 }

@@ -4,6 +4,8 @@ import { defineEndpoint } from '../../define';
 import { nowIso } from '../../mock-db';
 import { db } from '../../mock/tables';
 import { learnerDb } from '../../mock/learner-tables';
+import { consoleDb } from '../../mock/console-tables';
+import { aiLearningDb, mockLocale, newAttemptId, newReviewId, settle, type StoredReview } from '../../mock/ai-learning-tables';
 import type { Certificate, Course, Lesson, PillarId, QuizQuestion, User } from '../../../types';
 
 export interface MyCourse {
@@ -176,7 +178,7 @@ export const getLessonContent = defineEndpoint<LessonContent, { params: { course
   id: 'lms.lessons.get', service: 'core', method: 'GET', path: '/lms/courses/:courseId/lessons/:lessonId',
   roles: ['beneficiary'], summary: 'Content for one lesson: video sources, reading text or PDF link', srs: ['FR-A2.4', 'NFR-BW.3'],
   response: 'LessonContent',
-  notes: 'Enrolled learners only (403 "not_enrolled"). Video and PDF URLs are short-lived signed /media links to MinIO. Offer 360p, 480p and 720p renditions.',
+  notes: 'Enrolled learners only (403 "not_enrolled"). Video and PDF URLs are short-lived signed /media links to MinIO. Offer 360p, 480p and 720p renditions. Reading lessons return the text written in the course editor, or a generic text when none was written.',
 }, ({ args, fail }) => {
   const { courseId, lessonId } = args.params;
   const course = db.courses.get().find(c => c.id === courseId);
@@ -194,7 +196,9 @@ export const getLessonContent = defineEndpoint<LessonContent, { params: { course
       return { type: 'pdf', lessonId, fileName: `${slugify(lesson.title)}.pdf`, sizeMb: 0.8, pages: Math.max(2, Math.round(lesson.minutes / 2)), downloadUrl: `${media}/${slugify(lesson.title)}.pdf` };
     case 'quiz':
       return { type: 'quiz', lessonId };
-    default:
+    default: {
+      const written = aiLearningDb.readings.get()[quizKey(courseId, lessonId)];
+      if (written) return { type: 'reading', lessonId, ...written };
       return {
         type: 'reading', lessonId,
         intro: `This reading is part of ${course.title}. Take your time, and come back to it whenever you like. Everything here works on a slow connection.`,
@@ -204,6 +208,7 @@ export const getLessonContent = defineEndpoint<LessonContent, { params: { course
           { heading: 'Try it now', body: 'Pick one idea from this page and apply it to something you are working on this week. Note what happened in two or three sentences. You will use this note in the next quiz.' },
         ],
       };
+    }
   }
 });
 
@@ -303,6 +308,22 @@ export interface QuestionFeedback {
   result: 'correct' | 'incorrect' | 'review';
   /** only revealed once the quiz is passed or no attempts are left */
   correctOptions?: number[];
+  /** short answers: AI feedback is being written (poll getShortAnswerFeedback), or AI is turned off */
+  feedbackStatus?: 'pending' | 'off';
+}
+
+export type ShortAnswerVerdict = 'meets' | 'partly' | 'not_yet';
+
+/** Feedback on one short answer of the latest attempt. A reviewer's word replaces the AI suggestion. */
+export interface ShortAnswerFeedback {
+  questionId: string;
+  /** pending while the AI writes, failed when it could not (a reviewer will), off when AI is turned off */
+  status: 'pending' | 'done' | 'failed' | 'off';
+  verdict?: ShortAnswerVerdict;
+  feedback?: string;
+  /** true once a Pillar Representative reviewed the answer */
+  reviewed: boolean;
+  reviewerName?: string;
 }
 
 export interface QuizResult extends QuizState {
@@ -392,13 +413,54 @@ export const submitQuiz = defineEndpoint<QuizResult, { params: { courseId: strin
   });
   learnerDb.quizAttempts.update(d => { (d[key] ??= []).push({ at: nowIso(), score, passed, offline: !!args.body.offline }); });
 
+  // Short answers go to the pillar's review queue; the fake AI suggests feedback a few seconds later
+  const course = db.courses.get().find(c => c.id === courseId)!;
+  const authored = consoleDb.quizzes.get()[key]?.questions ?? [];
+  const attemptId = newAttemptId();
+  const submittedAt = nowIso();
+  const shortRows: StoredReview[] = questions.filter(q => q.type === 'short').map(q => ({
+    id: newReviewId(), attemptId, mine: true, learnerName: user?.name ?? 'Learner',
+    courseId, courseTitle: course.title, courseSlug: course.slug, pillarId: course.pillarId, lessonId, lessonTitle: quiz.title,
+    questionId: q.id, prompt: q.prompt,
+    guidance: (authored.find(x => x.id === q.id) as { guidance?: string } | undefined)?.guidance?.trim() || null,
+    answer: String(answers[q.id]).trim().slice(0, 2000), lang: mockLocale(),
+    aiReadyAt: new Date(Date.now() + 4000).toISOString(), ai: { status: 'pending', verdict: null, feedback: null }, final: null, submittedAt,
+  }));
+  if (shortRows.length) aiLearningDb.reviews.update(list => [...list, ...shortRows]);
+
   const state = quizState(courseId, lessonId);
   const reveal = passed || state.attemptsLeft === 0;
-  const progress = passed ? recordLessonDone(db.courses.get().find(c => c.id === courseId)!, lessonId, user) : null;
+  const progress = passed ? recordLessonDone(course, lessonId, user) : null;
   return {
     ...state, score, passMark: quiz.passMark,
-    feedback: graded.map(g => ({ questionId: g.questionId, result: g.result, ...(reveal && g.key ? { correctOptions: g.key } : {}) })),
+    feedback: graded.map((g): QuestionFeedback => ({
+      questionId: g.questionId, result: g.result,
+      ...(reveal && g.key ? { correctOptions: g.key } : {}),
+      ...(g.result === 'review' ? { feedbackStatus: 'pending' as const } : {}),
+    })),
     courseCompleted: !!progress?.courseCompleted,
     certificate: progress?.certificate ?? null,
   };
+});
+
+export const getShortAnswerFeedback = defineEndpoint<ShortAnswerFeedback[], { params: { courseId: string; lessonId: string } }>({
+  id: 'lms.quizzes.feedback', service: 'core', method: 'GET', path: '/lms/courses/:courseId/quizzes/:lessonId/feedback',
+  roles: ['beneficiary'], summary: 'Feedback on the short answers of the learner\'s latest attempt: the AI suggestion, or the review once a Pillar Representative saved one',
+  srs: ['FR-A2.6'], response: 'ShortAnswerFeedback[]',
+  notes: 'Empty before the first attempt. After a submit with feedbackStatus "pending", poll every 2 seconds until no item is pending. The AI gets the question, marking guidance and answer only, never the learner\'s name or contact details, and writes in the learner\'s language (account language, else Accept-Language).',
+}, ({ args, fail }) => {
+  const { courseId, lessonId } = args.params;
+  enrolledLesson(courseId, lessonId, fail);
+  const rows = aiLearningDb.reviews.get();
+  const settledRows = rows.map(settle);
+  if (settledRows.some((r, i) => r !== rows[i])) aiLearningDb.reviews.set(settledRows);
+  const mine = settledRows.filter(r => r.mine && r.courseId === courseId && r.lessonId === lessonId);
+  const latest = mine.reduce<StoredReview | null>((a, r) => (!a || r.submittedAt > a.submittedAt ? r : a), null);
+  return mine.filter(r => r.attemptId === latest?.attemptId).map((r): ShortAnswerFeedback => (r.final
+    ? { questionId: r.questionId, status: 'done', verdict: r.final.verdict, feedback: r.final.feedback, reviewed: true, reviewerName: r.final.reviewerName }
+    : {
+      questionId: r.questionId, status: r.ai.status, reviewed: false,
+      ...(r.ai.status === 'done' && r.ai.verdict ? { verdict: r.ai.verdict } : {}),
+      ...(r.ai.status === 'done' && r.ai.feedback ? { feedback: r.ai.feedback } : {}),
+    }));
 });

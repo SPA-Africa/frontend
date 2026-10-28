@@ -2,21 +2,27 @@
 
 // Quiz player (SRS FR-A2.6 to FR-A2.9). Rules come from the API: pass mark and attempts from settings,
 // grading on the server. A quiz can be downloaded to the device; an attempt taken offline is
-// queued and graded when the connection comes back.
+// queued and graded when the connection comes back. Short answers get AI feedback a few seconds
+// after submitting (polled), which a Pillar Representative may later confirm or rewrite.
 
 import { useEffect, useState } from 'react';
-import { Check, CloudDownload, CloudOff, Hourglass, Lock, RotateCcw, X } from 'lucide-react';
-import { Badge, Button, Textarea } from '@/components/ui';
+import { Bot, Check, CloudDownload, CloudOff, Hourglass, Lock, RotateCcw, UserCheck, X } from 'lucide-react';
+import { Badge, Button, Textarea, type Tone } from '@/components/ui';
 import { Async, Meter, Panel, Skeleton } from '@/components/dash';
 import { ApiError } from '@/lib/api/http';
 import { errorMessage, useApi } from '@/lib/api/hooks';
 import { lms } from '@/lib/api/services';
-import type { LearnerQuestion, Quiz, QuizResult, QuizSubmission } from '@/lib/api/services/core/lms';
+import type { LearnerQuestion, QuestionFeedback, Quiz, QuizResult, QuizSubmission, ShortAnswerFeedback, ShortAnswerVerdict } from '@/lib/api/services/core/lms';
 import { useT } from '@/lib/i18n';
 import { cx, pct } from '@/lib/format';
 import { offlineQuiz, useOfflineStore, useOnline } from './offline';
 
 type Answers = Record<string, number[] | string>;
+
+/** Poll for AI feedback every 2 seconds, for about 40 seconds */
+const POLL_MS = 2000;
+const POLL_LIMIT = 20;
+const VERDICT_TONE: Record<ShortAnswerVerdict, Tone> = { meets: 'ok', partly: 'gold', not_yet: 'brand' };
 
 export function QuizEngine({ courseId, lessonId, onResult, onToast }: {
   courseId: string; lessonId: string; onResult: (r: QuizResult) => void; onToast: (m: string) => void;
@@ -30,9 +36,41 @@ export function QuizEngine({ courseId, lessonId, onResult, onToast }: {
   const [result, setResult] = useState<QuizResult | null>(null);
   const [retaking, setRetaking] = useState(false);
   const [busy, setBusy] = useState(false);
+  // AI or reviewer feedback on the short answers just submitted, keyed by question id
+  const [shortFb, setShortFb] = useState<Record<string, ShortAnswerFeedback>>({});
+  const [slow, setSlow] = useState(false);
+  // feedback on the latest attempt, for a learner coming back to the quiz
+  const hasShort = !!quiz.data?.questions.some(x => x.type === 'short') && (quiz.data?.attemptsUsed ?? 0) > 0;
+  const last = useApi(() => lms.getShortAnswerFeedback({ params: { courseId, lessonId } }), [courseId, lessonId], { enabled: online && hasShort });
+  const setLast = last.setData;
 
   // when offline, fall back to the downloaded copy
   const q: Quiz | undefined = quiz.data ?? saved ?? undefined;
+
+  // after a submit, ask for the short-answer feedback until it is written (or give up after ~40 s)
+  useEffect(() => {
+    if (!result?.feedback.some(f => f.feedbackStatus === 'pending')) return;
+    let stopped = false;
+    let polls = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setSlow(false);
+    const poll = async () => {
+      polls++;
+      try {
+        const list = await lms.getShortAnswerFeedback({ params: { courseId, lessonId } });
+        if (stopped) return;
+        setShortFb(Object.fromEntries(list.map(f => [f.questionId, f])));
+        setLast(list);
+        if (!list.some(f => f.status === 'pending')) return;
+      } catch {
+        if (stopped) return;
+      }
+      if (polls >= POLL_LIMIT) { setSlow(true); return; }
+      timer = setTimeout(poll, POLL_MS);
+    };
+    timer = setTimeout(poll, POLL_MS);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [result, courseId, lessonId, setLast]);
 
   const send = async (submission: QuizSubmission) => {
     setBusy(true);
@@ -92,7 +130,8 @@ export function QuizEngine({ courseId, lessonId, onResult, onToast }: {
     }
     send(submission);
   };
-  const retake = () => { setAnswers({}); setResult(null); setRetaking(true); };
+  const retake = () => { setAnswers({}); setResult(null); setShortFb({}); setSlow(false); setRetaking(true); };
+  const lastFeedback = !result ? (last.data ?? []) : [];
   const pick = (qid: string, idx: number, multi: boolean) => {
     if (result) return;
     setAnswers(a => {
@@ -164,10 +203,24 @@ export function QuizEngine({ courseId, lessonId, onResult, onToast }: {
         </Panel>
       )}
 
+      {lastFeedback.length > 0 && (
+        <Panel title={t('ai.quiz.lastTitle')}>
+          <ul className="space-y-5">
+            {lastFeedback.map(f => (
+              <li key={f.questionId}>
+                <p className="font-semibold">{q.questions.find(x => x.id === f.questionId)?.prompt}</p>
+                <ShortFeedback ai={f} />
+              </li>
+            ))}
+          </ul>
+        </Panel>
+      )}
+
       {!showPassed && !locked && (
         <ol className="space-y-4">
           {q.questions.map((question, i) => (
             <QuestionCard key={question.id} n={i + 1} q={question} value={answers[question.id]} fb={feedback(question.id)} disabled={!!result}
+              ai={shortFb[question.id]} slow={slow}
               onPick={(idx, multi) => pick(question.id, idx, multi)} onText={v => setAnswers(a => ({ ...a, [question.id]: v }))} />
           ))}
         </ol>
@@ -185,8 +238,8 @@ export function QuizEngine({ courseId, lessonId, onResult, onToast }: {
   );
 }
 
-function QuestionCard({ n, q, value, fb, disabled, onPick, onText }: {
-  n: number; q: LearnerQuestion; value: number[] | string | undefined; fb?: QuizResult['feedback'][number]; disabled: boolean;
+function QuestionCard({ n, q, value, fb, ai, slow, disabled, onPick, onText }: {
+  n: number; q: LearnerQuestion; value: number[] | string | undefined; fb?: QuestionFeedback; ai?: ShortAnswerFeedback; slow: boolean; disabled: boolean;
   onPick: (idx: number, multi: boolean) => void; onText: (v: string) => void;
 }) {
   const t = useT();
@@ -228,8 +281,38 @@ function QuestionCard({ n, q, value, fb, disabled, onPick, onText }: {
           </div>
         )}
         {fb?.result === 'incorrect' && <p className="mt-3 text-sm text-muted">{fb.correctOptions ? t('learner.quiz.seeCorrect') : t('learner.quiz.hidden')}</p>}
-        {fb?.result === 'review' && <p className="mt-3 text-sm text-muted">{t('learner.quiz.reviewNote')}</p>}
+        {fb?.result === 'review' && (fb.feedbackStatus
+          ? <ShortFeedback ai={ai} status={fb.feedbackStatus} slow={slow} />
+          : <p className="mt-3 text-sm text-muted">{t('learner.quiz.reviewNote')}</p>)}
       </fieldset>
     </li>
   );
+}
+
+/** Feedback on one short answer: being written, written (AI suggestion or review), or waiting for a reviewer */
+function ShortFeedback({ ai, status, slow }: { ai?: ShortAnswerFeedback; status?: QuestionFeedback['feedbackStatus']; slow?: boolean }) {
+  const t = useT();
+  if (ai?.status === 'done' && ai.verdict && ai.feedback) {
+    return (
+      <div className="mt-3 rounded-xl bg-surface p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge tone={VERDICT_TONE[ai.verdict]}>{t(`ai.verdict.${ai.verdict}`)}</Badge>
+          <span className="inline-flex items-center gap-1 text-xs text-muted">
+            {ai.reviewed ? <UserCheck size={13} aria-hidden /> : <Bot size={13} aria-hidden />}
+            {ai.reviewed ? (ai.reviewerName ? t('ai.quiz.reviewedBy', { name: ai.reviewerName }) : t('ai.quiz.reviewed')) : t('ai.quiz.aiLabel')}
+          </span>
+        </div>
+        <p className="mt-2 whitespace-pre-line text-[15px]">{ai.feedback}</p>
+      </div>
+    );
+  }
+  if ((ai?.status ?? status) === 'pending') {
+    return (
+      <p role="status" className="mt-3 flex items-center gap-2 text-sm text-muted">
+        <Hourglass size={14} className={cx('shrink-0', !slow && 'animate-pulse')} aria-hidden />
+        {slow ? t('ai.quiz.slow') : t('ai.quiz.pending')}
+      </p>
+    );
+  }
+  return <p className="mt-3 text-sm text-muted">{t('ai.quiz.waitReview')}</p>;
 }

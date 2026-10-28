@@ -16,6 +16,7 @@ import { useApi } from '@/lib/api/hooks';
 import * as notifications from '@/lib/api/services/core/notifications';
 import type { Role } from '@/lib/types';
 import { cx } from '@/lib/format';
+import { HelpAssistant } from '@/components/assistant/HelpAssistant';
 import { portalNav } from './nav';
 
 /* ---------- small popover helper ---------- */
@@ -378,10 +379,13 @@ export function PortalShell({ role, children }: { role: Role; children: React.Re
           </div>
         </header>
 
-        <main className="min-w-0 flex-1 px-4 py-6 md:px-8 md:py-8">
+        {/* bottom padding keeps the end of every page clear of the help assistant button */}
+        <main className="min-w-0 flex-1 px-4 pb-24 pt-6 md:px-8 md:pt-8">
           <div className="fade-in mx-auto max-w-[1240px]" key={pathname}>{children}</div>
         </main>
       </div>
+
+      <HelpAssistant />
     </div>
   );
 }
