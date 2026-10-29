@@ -19,6 +19,8 @@ export * as learners from './core/learners';
 export * as competitions from './core/competitions';
 export * as judging from './core/judging';
 export * as governance from './core/governance';
+export * as reviews from './core/reviews';
+export * as assistant from './core/assistant';
 // ai-svc (FastAPI, /api/ai)
 export * as metrics from './ai/metrics';
 export * as recommendations from './ai/recommendations';

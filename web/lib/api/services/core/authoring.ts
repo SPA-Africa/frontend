@@ -1,16 +1,32 @@
 // core-svc / authoring: pillar-scoped course authoring and publishing (SRS FR-A2.14, FR-B1.3)
 //
 // Courses live in the same `courses` table learners read from (lms, catalog). Publishing flips
-// `published` so the course appears in the public catalogue and can be enrolled in.
+// `published` so the course appears in the public catalogue and can be enrolled in. The writing
+// assistant (`assist`) drafts outlines, reading text and quiz questions with AI; nothing is saved
+// until the author saves the course.
 
 import { defineEndpoint, type MockContext, type CallArgs } from '../../define';
 import { nowIso } from '../../mock-db';
 import { db } from '../../mock/tables';
-import { appendAudit, consoleDb, defaultQuiz, type QuizDefinition } from '../../mock/console-tables';
+import { appendAudit, consoleDb, defaultQuiz } from '../../mock/console-tables';
+import { aiLearningDb, courseLang, fakeOutline, fakeQuestions, fakeReading, type ReadingContent } from '../../mock/ai-learning-tables';
 import { pillarById } from '../../../mock/data';
 import type { Course, LessonType, PillarId, QuizQuestion } from '../../../types';
 
-export type { QuizDefinition } from '../../mock/console-tables';
+export type { ReadingContent } from '../../mock/ai-learning-tables';
+
+/** A question in the editor. Short questions may carry marking guidance, which learners never see. */
+export interface AuthoringQuizQuestion extends QuizQuestion {
+  /** short answers: what a good answer includes, up to 1000 characters; used by reviewers and AI feedback */
+  guidance?: string;
+}
+
+export interface QuizDefinition {
+  /** 1..100, percent */
+  passMark: number;
+  maxRetakes: number;
+  questions: AuthoringQuizQuestion[];
+}
 
 export type CourseLanguage = Course['language'][number];
 
@@ -45,7 +61,11 @@ export interface AuthoringCourseRow {
   flags: CourseFlag[];
 }
 
-export interface AuthoringLesson { id: string; title: string; type: LessonType; minutes: number; quiz?: QuizDefinition }
+/**
+ * A lesson in the editor. Quiz lessons carry their quiz; reading lessons may carry their text.
+ * On save, leaving `content` out keeps the stored text and `null` clears it.
+ */
+export interface AuthoringLesson { id: string; title: string; type: LessonType; minutes: number; quiz?: QuizDefinition; content?: ReadingContent | null }
 export interface AuthoringModule { id: string; title: string; lessons: AuthoringLesson[] }
 
 /** Body of create and update. Ids of new modules and lessons may be client-generated. */
@@ -81,7 +101,28 @@ const repPillar = ({ user, fail }: Ctx, requested?: PillarId): PillarId | undefi
 
 const lessonsOf = (c: Course) => c.modules.flatMap(m => m.lessons);
 const quizKey = (courseId: string, lessonId: string) => `${courseId}:${lessonId}`;
-const quizOf = (courseId: string, lessonId: string) => consoleDb.quizzes.get()[quizKey(courseId, lessonId)] ?? defaultQuiz();
+const quizOf = (courseId: string, lessonId: string): QuizDefinition => consoleDb.quizzes.get()[quizKey(courseId, lessonId)] ?? defaultQuiz();
+const readingOf = (courseId: string, lessonId: string) => aiLearningDb.readings.get()[quizKey(courseId, lessonId)];
+
+const MAX_GUIDANCE = 1000;
+const READING_LIMITS = { intro: 4000, sections: 30, heading: 200, body: 8000, items: 20, item: 500 };
+
+/** Trimmed reading text, null when empty; 400 reading_too_long past the limits */
+function parseReading(ctx: Ctx, c: ReadingContent | null | undefined, lessonTitle: string): ReadingContent | null {
+  if (!c) return null;
+  const sections = (c.sections ?? []).map(s => {
+    const body = s.body?.trim() ?? '';
+    const list = (s.list ?? []).map(i => i.trim()).filter(Boolean);
+    return { heading: s.heading?.trim() ?? '', ...(body ? { body } : {}), ...(list.length ? { list } : {}) };
+  }).filter(s => s.heading || s.body || s.list);
+  const intro = c.intro?.trim() ?? '';
+  const L = READING_LIMITS;
+  if (intro.length > L.intro || sections.length > L.sections || sections.some(s => s.heading.length > L.heading || (s.body?.length ?? 0) > L.body
+    || (s.list?.length ?? 0) > L.items || (s.list ?? []).some(i => i.length > L.item))) {
+    ctx.fail(400, 'reading_too_long', `The reading text of "${lessonTitle || 'Untitled'}" is too long`);
+  }
+  return intro || sections.length ? { intro, sections } : null;
+}
 
 function loadOwned(ctx: Ctx, id: string): Course {
   const course = db.courses.get().find(c => c.id === id);
@@ -96,7 +137,14 @@ function toAuthoring(c: Course): AuthoringCourse {
   return {
     id: c.id, slug: c.slug, pillarId: c.pillarId, published: c.published, enrolled: c.enrolled,
     title: c.title, program: c.program, level: c.level, hours: c.hours, languages: [...c.language], summary: c.summary, outcomes: [...c.outcomes],
-    modules: c.modules.map(m => ({ ...m, lessons: m.lessons.map(l => (l.type === 'quiz' ? { ...l, quiz: quizOf(c.id, l.id) } : { ...l })) })),
+    modules: c.modules.map(m => ({
+      ...m,
+      lessons: m.lessons.map((l): AuthoringLesson => {
+        if (l.type === 'quiz') return { ...l, quiz: quizOf(c.id, l.id) };
+        const text = l.type === 'reading' ? readingOf(c.id, l.id) : undefined;
+        return text ? { ...l, content: text } : { ...l };
+      }),
+    })),
     updatedAt: meta?.updatedAt ?? '2026-06-01T08:00:00Z',
     publishedAt: meta?.publishedAt,
   };
@@ -130,6 +178,8 @@ function validateDraft(ctx: Ctx, d: CourseDraftInput, pillarId: PillarId) {
   d.modules.forEach(m => m.lessons.forEach(l => {
     if (!(l.minutes >= 1 && l.minutes <= 240)) ctx.fail(400, 'invalid_minutes', `Lesson "${l.title || 'Untitled'}" must last between 1 and 240 minutes`);
     if (l.quiz && !(l.quiz.passMark >= 1 && l.quiz.passMark <= 100)) ctx.fail(400, 'invalid_pass_mark', 'Pass mark must be between 1 and 100');
+    if (l.quiz?.questions.some(q => (q.guidance?.trim().length ?? 0) > MAX_GUIDANCE)) ctx.fail(400, 'guidance_too_long', 'Keep the marking guidance under 1000 characters');
+    if (l.type === 'reading' && l.content) parseReading(ctx, l.content, l.title);
   }));
 }
 
@@ -148,7 +198,7 @@ export function publishProblems(c: AuthoringCourse | CourseDraftInput): string[]
   return out;
 }
 
-function write(courseId: string, d: CourseDraftInput, base: Course): Course {
+function write(ctx: Ctx, courseId: string, d: CourseDraftInput, base: Course): Course {
   const now = nowIso();
   const course: Course = {
     ...base,
@@ -158,7 +208,25 @@ function write(courseId: string, d: CourseDraftInput, base: Course): Course {
   };
   consoleDb.quizzes.update(q => {
     Object.keys(q).filter(k => k.startsWith(`${courseId}:`)).forEach(k => delete q[k]);
-    d.modules.forEach(m => m.lessons.forEach(l => { if (l.type === 'quiz' && l.quiz) q[quizKey(courseId, l.id)] = l.quiz; }));
+    d.modules.forEach(m => m.lessons.forEach(l => {
+      if (l.type !== 'quiz' || !l.quiz) return;
+      const questions = l.quiz.questions.map(x => {
+        const guidance = x.type === 'short' ? x.guidance?.trim() : undefined;
+        const { guidance: _drop, ...rest } = x;
+        return guidance ? { ...rest, guidance } : rest;
+      });
+      q[quizKey(courseId, l.id)] = { ...l.quiz, questions };
+    }));
+  });
+  // Reading text: absent keeps what is stored, null clears it; text of removed lessons goes
+  const lessonIds = new Set(d.modules.flatMap(m => m.lessons.map(l => l.id)));
+  aiLearningDb.readings.update(r => {
+    Object.keys(r).filter(k => k.startsWith(`${courseId}:`) && !lessonIds.has(k.slice(courseId.length + 1))).forEach(k => delete r[k]);
+    d.modules.forEach(m => m.lessons.forEach(l => {
+      if (l.type !== 'reading' || l.content === undefined) return;
+      const text = parseReading(ctx, l.content, l.title);
+      if (text) r[quizKey(courseId, l.id)] = text; else delete r[quizKey(courseId, l.id)];
+    }));
   });
   consoleDb.courseMeta.update(m => { m[courseId] = { ...m[courseId], updatedAt: now }; });
   db.courses.update(list => {
@@ -219,7 +287,7 @@ export const createCourse = defineEndpoint<AuthoringCourse, { body: CourseDraftI
   let slug = slugify(d.title), n = 2;
   while (taken.has(slug)) slug = `${slugify(d.title)}-${n++}`;
   const id = `c-${slug}`;
-  const course = write(id, d, { id, slug, pillarId, published: false, enrolled: 0 } as Course);
+  const course = write(ctx, id, d, { id, slug, pillarId, published: false, enrolled: 0 } as Course);
   appendAudit(ctx.user, 'Created course', course.title, pillarId);
   return toAuthoring(course);
 });
@@ -233,7 +301,7 @@ export const updateCourse = defineEndpoint<AuthoringCourse, { params: { id: stri
   const base = loadOwned(ctx, ctx.args.params.id);
   validateDraft(ctx, ctx.args.body, base.pillarId);
   if (base.published && publishProblems(ctx.args.body).length) ctx.fail(422, 'not_publishable', 'A published course must stay complete. Fix the highlighted items or unpublish first.');
-  const course = write(base.id, ctx.args.body, base);
+  const course = write(ctx, base.id, ctx.args.body, base);
   appendAudit(ctx.user, 'Edited course', course.title, course.pillarId);
   return toAuthoring(course);
 });
@@ -267,4 +335,57 @@ export const unpublishCourse = defineEndpoint<AuthoringCourse, { params: { id: s
   consoleDb.courseMeta.update(m => { m[base.id] = { ...m[base.id], updatedAt: nowIso() }; });
   appendAudit(ctx.user, 'Unpublished course', base.title, base.pillarId);
   return toAuthoring({ ...base, published: false });
+});
+
+/* ---------- writing assistant ---------- */
+
+export type AssistTask = 'outline' | 'reading' | 'quiz';
+
+export interface AssistRequest {
+  task: AssistTask;
+  course: { title: string; summary?: string; outcomes?: string[]; level?: Course['level']; languages?: CourseLanguage[]; program?: string };
+  /** reading and quiz: the lesson being written */
+  lesson?: { title: string; minutes?: number };
+  /** quiz: how many questions, 1 to 10 (default 5) */
+  count?: number;
+  /** what the course already has, so suggestions do not repeat it */
+  existing?: { moduleTitles?: string[]; questionPrompts?: string[] };
+}
+
+export interface DraftLesson { title: string; type: LessonType; minutes: number }
+export interface DraftModule { title: string; lessons: DraftLesson[] }
+
+export type AssistResult =
+  | { task: 'outline'; modules: DraftModule[] }
+  | { task: 'reading'; content: ReadingContent }
+  | { task: 'quiz'; questions: AuthoringQuizQuestion[] };
+
+const ASSIST_HOURLY_LIMIT = 40;
+
+export const assist = defineEndpoint<AssistResult, { body: AssistRequest; query?: { pillar?: PillarId } }>({
+  id: 'authoring.assist', service: 'core', method: 'POST', path: '/authoring/assist',
+  roles: ['pillar_rep', 'executive_admin'], summary: 'Writing assistant: an AI draft of a course outline, a reading lesson or quiz questions. Nothing is saved.',
+  srs: ['FR-A2.14'], request: 'AssistRequest', response: 'AssistResult', query: ['pillar?: PillarId (executive_admin only)'],
+  notes: 'Runs without a database transaction (it waits for Claude, effort medium). Written in the course\'s first language. outline: 3 to 6 modules, each ending with a quiz lesson, minutes 1 to 240. reading: { intro, sections[{ heading, body?, list? }] }. quiz: count questions with server-generated ids, answers within the options, true_false options ["True", "False"], short questions with guidance. 400 invalid_task, title_required, lesson_title_required, invalid_count. 429 ai_rate_limited after AI_AUTHORING_HOURLY_LIMIT drafts per person per hour (default 40). 422 ai_declined when the model declines. 503 ai_unavailable "The writing assistant is not available right now" when AI is off or failing. Only usage is logged; the course is not read or written.',
+}, async ({ args, user, fail }) => {
+  const b = args.body ?? ({} as AssistRequest);
+  if (!['outline', 'reading', 'quiz'].includes(b.task)) fail(400, 'invalid_task', 'Choose what to draft: an outline, reading text or quiz questions');
+  const title = b.course?.title?.trim() ?? '';
+  if (title.length < 5) fail(400, 'title_required', 'Give the course a title of at least 5 characters');
+  const lessonTitle = b.lesson?.title?.trim() ?? '';
+  if (b.task !== 'outline' && !lessonTitle) fail(400, 'lesson_title_required', 'Give the lesson a title first');
+  const count = b.count ?? 5;
+  if (b.task === 'quiz' && !(Number.isInteger(count) && count >= 1 && count <= 10)) fail(400, 'invalid_count', 'Ask for 1 to 10 questions');
+
+  const key = user?.id ?? 'anonymous';
+  const hourAgo = Date.now() - 3_600_000;
+  const recent = (aiLearningDb.assistUse.get()[key] ?? []).filter(at => Date.parse(at) > hourAgo);
+  if (recent.length >= ASSIST_HOURLY_LIMIT) fail(429, 'ai_rate_limited', 'You have used the writing assistant a lot in the last hour. Try again later.');
+  aiLearningDb.assistUse.update(u => { u[key] = [...recent, nowIso()]; });
+  await new Promise(r => setTimeout(r, 900));
+
+  const lang = courseLang(b.course.languages);
+  if (b.task === 'outline') return { task: 'outline', modules: fakeOutline(b.course.outcomes ?? [], lang) };
+  if (b.task === 'reading') return { task: 'reading', content: fakeReading(lessonTitle, lang) };
+  return { task: 'quiz', questions: fakeQuestions(lessonTitle, lang, count) };
 });

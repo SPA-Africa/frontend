@@ -2,15 +2,17 @@
 
 // Blind grading terminal: anonymised summary and documents, weighted rubric, required comment,
 // conflict-of-interest recusal, submit with confirm, then the other judges' average (FR-B2.5).
+// Documents open in an in-page viewer showing the anonymised copy only (FR-B2.2, NFR-SEC.9).
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, CheckCircle2, EyeOff, FileText, Presentation, ShieldAlert, Users } from 'lucide-react';
-import { Badge, Button, Checkbox, Field, Select, Textarea } from '@/components/ui';
+import { ArrowLeft, CheckCircle2, Clock, ExternalLink, EyeOff, FileText, FileX, Presentation, RefreshCw, ShieldAlert, Users } from 'lucide-react';
+import { Badge, Button, buttonClass, Checkbox, Field, Select, Textarea } from '@/components/ui';
 import { Modal, useToast } from '@/components/ui/client';
 import { Async, PageHead, Panel, Skeleton, SkeletonPanel, StatusPill } from '@/components/dash';
 import { ConfirmDialog, FormError } from '@/components/console/ConsoleKit';
+import { ApiError } from '@/lib/api/http';
 import { errorMessage, useApi } from '@/lib/api/hooks';
 import { judging } from '@/lib/api/services';
 import type { DocumentLink, EntryDocument, GradingEntry, MyScore, RecusalReason } from '@/lib/api/services/core/judging';
@@ -50,7 +52,10 @@ function Terminal({ entry }: { entry: GradingEntry }) {
   const [reason, setReason] = useState<RecusalReason | ''>('');
   const [details, setDetails] = useState('');
   const [coiOk, setCoiOk] = useState(false);
-  const [doc, setDoc] = useState<{ d: EntryDocument; link?: DocumentLink } | null>(null);
+  const [docs, setDocs] = useState<EntryDocument[]>(entry.documents);
+  const [checking, setChecking] = useState(false);
+  /** the document viewer: `frame` is the first link (the iframe keeps it), `link` the freshest one */
+  const [viewer, setViewer] = useState<{ d: EntryDocument; frame?: string; link?: DocumentLink; error?: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { toast, toastNode } = useToast();
@@ -95,10 +100,48 @@ function Terminal({ entry }: { entry: GradingEntry }) {
     } catch (e) { setError(errorMessage(e)); setBusy(false); }
   };
 
+  const refreshDocs = useCallback(async (quiet = false) => {
+    setChecking(true);
+    try { setDocs((await judging.getEntry({ params: { code: entry.code } })).documents); }
+    catch (e) { if (!quiet) toast(errorMessage(e)); }
+    finally { setChecking(false); }
+  }, [entry.code, toast]);
+
+  // Anonymised copies are prepared in the background after submission: look again every 30 seconds
+  const preparing = docs.some(d => d.status === 'pending');
+  useEffect(() => {
+    if (!preparing) return;
+    const id = setTimeout(() => { refreshDocs(true); }, 30_000);
+    return () => clearTimeout(id);
+  }, [preparing, docs, refreshDocs]);
+
   const openDoc = async (d: EntryDocument) => {
-    setDoc({ d });
-    try { setDoc({ d, link: await judging.getDocumentLink({ params: { code: entry.code, kind: d.kind } }) }); } catch (e) { toast(errorMessage(e)); }
+    setViewer({ d });
+    try {
+      const link = await judging.getDocumentLink({ params: { code: entry.code, kind: d.kind } });
+      setViewer(v => (v?.d.kind === d.kind ? { d, frame: link.url, link } : v));
+    } catch (e) {
+      const code = e instanceof ApiError ? e.code : '';
+      const status = code === 'redaction_pending' ? 'pending' as const : code === 'redaction_unavailable' ? 'unavailable' as const : null;
+      const error = status === 'pending' ? t('ai.docs.errorPending') : status === 'unavailable' ? t('ai.docs.errorUnavailable') : errorMessage(e);
+      setViewer(v => (v?.d.kind === d.kind ? { d, error } : v));
+      if (status) setDocs(list => list.map(x => (x.kind === d.kind ? { ...x, status } : x)));
+    }
   };
+
+  // Links expire after 5 minutes: renew the "new tab" link shortly before, the open viewer keeps working
+  const viewerKind = viewer?.d.kind;
+  const linkExpiresAt = viewer?.link?.expiresAt;
+  useEffect(() => {
+    if (!viewerKind || !linkExpiresAt) return;
+    const id = setTimeout(async () => {
+      try {
+        const link = await judging.getDocumentLink({ params: { code: entry.code, kind: viewerKind } });
+        setViewer(v => (v?.d.kind === viewerKind && v.link ? { ...v, link } : v));
+      } catch {}
+    }, Math.max(5_000, Date.parse(linkExpiresAt) - Date.now() - 20_000));
+    return () => clearTimeout(id);
+  }, [viewerKind, linkExpiresAt, entry.code]);
 
   return (
     <>
@@ -122,23 +165,38 @@ function Terminal({ entry }: { entry: GradingEntry }) {
           </Panel>
 
           <Panel title={t('judge.documents')}>
-            <ul className="flex flex-col gap-2">
-              {entry.documents.map(d => {
-                const Icon = d.kind === 'pitch_deck' ? Presentation : FileText;
-                return (
-                  <li key={d.kind} className="flex items-center gap-3 rounded-xl border border-line p-3">
-                    <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-surface text-muted"><Icon size={18} aria-hidden /></span>
-                    <div className="min-w-0 flex-1">
-                      <div className="font-semibold">{t(`judge.doc.${d.kind}`)}</div>
-                      <div className="truncate font-mono text-xs text-muted">{d.name} · {d.sizeMb.toFixed(1)} MB</div>
-                    </div>
-                    {d.scan === 'clean'
-                      ? <Button variant="ghost" size="sm" onClick={() => openDoc(d)}>{t('judge.view')}<span className="sr-only">: {t(`judge.doc.${d.kind}`)}</span></Button>
-                      : <Badge tone="gold">{t('judge.scanPending')}</Badge>}
-                  </li>
-                );
-              })}
-            </ul>
+            {docs.length === 0 ? (
+              <p className="flex items-start gap-2 text-sm text-muted"><FileX size={16} className="mt-0.5 shrink-0" aria-hidden /> {t('ai.docs.none')}</p>
+            ) : (
+              <ul className="flex flex-col gap-2">
+                {docs.map(d => {
+                  const Icon = d.kind === 'pitch_deck' ? Presentation : FileText;
+                  return (
+                    <li key={d.kind} className="flex items-center gap-3 rounded-xl border border-line p-3">
+                      <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-surface text-muted"><Icon size={18} aria-hidden /></span>
+                      <div className="min-w-0 flex-1">
+                        <div className="font-semibold">{t(`judge.doc.${d.kind}`)}</div>
+                        <div className="truncate font-mono text-xs text-muted">{d.name} · {d.sizeMb.toFixed(1)} MB</div>
+                      </div>
+                      {d.scan !== 'clean' ? <Badge tone="gold">{t('judge.scanPending')}</Badge>
+                        : d.status === 'ready' ? <Button variant="ghost" size="sm" onClick={() => openDoc(d)}>{t('judge.view')}<span className="sr-only">: {t(`judge.doc.${d.kind}`)}</span></Button>
+                        : d.status === 'pending' ? <Badge tone="gold" dot>{t('ai.docs.pending')}</Badge>
+                        : <Badge>{t('ai.docs.unavailable')}</Badge>}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {preparing && (
+              <div className="mt-3 flex flex-wrap items-center gap-3 rounded-xl bg-surface p-3 text-sm">
+                <Clock size={16} className="shrink-0 text-muted" aria-hidden />
+                <span className="min-w-0 flex-1 text-muted">{t('ai.docs.pendingNote')}</span>
+                <Button variant="ghost" size="sm" className="bg-bg" disabled={checking} onClick={() => refreshDocs()}>
+                  <RefreshCw size={15} className={cx(checking && 'animate-spin')} aria-hidden /> {t('ai.docs.checkAgain')}
+                </Button>
+              </div>
+            )}
+            {docs.some(d => d.status === 'unavailable') && <p className="mt-3 text-sm text-muted">{t('ai.docs.unavailableNote')}</p>}
           </Panel>
 
           <Panel title={t('judge.rubric')} action={<span className="text-sm text-muted">{t('judge.scale')}</span>}>
@@ -259,17 +317,34 @@ function Terminal({ entry }: { entry: GradingEntry }) {
         </div>
       </Modal>
 
-      <Modal wide open={!!doc} onClose={() => setDoc(null)} title={doc ? t(`judge.doc.${doc.d.kind}`) : ''}>
-        {doc && (
-          <div className="grid min-h-72 place-items-center rounded-2xl border border-dashed border-line bg-surface p-8 text-center">
-            <div>
-              <FileText size={32} className="mx-auto text-subtle" aria-hidden />
-              <div className="mt-3 font-mono text-sm font-semibold">{doc.d.name}</div>
-              <p className="mt-2 max-w-sm text-sm text-muted">{t('judge.redacted')}</p>
-              <div className="mt-4 flex flex-wrap justify-center gap-2">
-                <Badge tone="ok">{t('judge.scanClean')}</Badge>
-                {doc.link ? <Badge>{t('judge.linkExpires', { time: fmtDate(new Date(doc.link.expiresAt), { hour: '2-digit', minute: '2-digit' }) })}</Badge> : <Skeleton className="h-6 w-28 rounded-full" />}
+      <Modal wide open={!!viewer} onClose={() => setViewer(null)} title={viewer ? t(`judge.doc.${viewer.d.kind}`) : ''}>
+        {viewer && (
+          <div className="flex flex-col gap-4">
+            <p className="flex items-start gap-2 text-sm text-muted"><EyeOff size={16} className="mt-0.5 shrink-0" aria-hidden /> {t('ai.docs.notice')}</p>
+            {viewer.error ? (
+              <div role="alert" className="grid min-h-72 place-items-center rounded-2xl border border-dashed border-line bg-surface p-8 text-center">
+                <div>
+                  <FileX size={32} className="mx-auto text-subtle" aria-hidden />
+                  <div className="mt-3 font-mono text-sm font-semibold">{viewer.d.name}</div>
+                  <p className="mt-2 max-w-sm text-sm text-muted">{viewer.error}</p>
+                </div>
               </div>
+            ) : viewer.frame ? (
+              <iframe src={viewer.frame} title={t('ai.docs.frameTitle', { kind: t(`judge.doc.${viewer.d.kind}`), code: entry.code })}
+                className="h-[65vh] w-full rounded-2xl border border-line bg-surface" />
+            ) : (
+              <Skeleton className="h-[65vh] w-full rounded-2xl" />
+            )}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="truncate font-mono text-xs text-muted">{viewer.d.name}</span>
+              {viewer.link && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge>{t('judge.linkExpires', { time: fmtDate(new Date(viewer.link.expiresAt), { hour: '2-digit', minute: '2-digit' }) })}</Badge>
+                  <a href={viewer.link.url} target="_blank" rel="noopener noreferrer" className={buttonClass('ghost', 'sm')}>
+                    <ExternalLink size={15} aria-hidden /> {t('ai.docs.openTab')}
+                  </a>
+                </div>
+              )}
             </div>
           </div>
         )}

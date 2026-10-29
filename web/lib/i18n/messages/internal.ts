@@ -23,6 +23,8 @@ export const internal: Messages = {
   'console.age.15 to 24': { en: '15 to 24', fr: '15 à 24 ans', rw: "Imyaka 15 kugeza 24" },
   'console.age.25 to 35': { en: '25 to 35', fr: '25 à 35 ans', rw: "Imyaka 25 kugeza 35" },
   'console.age.36 and over': { en: '36 and over', fr: '36 ans et plus', rw: "Imyaka 36 kuzamura" },
+  'console.gender.Undisclosed': { en: 'Not stated', fr: 'Non précisé', rw: "Ntibyavuzwe" },
+  'console.age.Unknown': { en: 'Unknown', fr: 'Inconnu', rw: "Ntibizwi" },
 
   /* ---------- console: overview ---------- */
   'console.home.title': { en: '{pillar} pillar', fr: 'Pilier {pillar}', rw: "Inkingi ya {pillar}" },

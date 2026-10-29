@@ -440,6 +440,67 @@
     "fullPath": "/api/core/market/listings/me"
   },
   {
+    "id": "assistant.conversations.delete",
+    "service": "core",
+    "method": "DELETE",
+    "path": "/assistant/conversations/:id",
+    "roles": [
+      "authenticated"
+    ],
+    "summary": "Delete one of the caller's help assistant conversations",
+    "response": "void (204)",
+    "notes": "404 conversation_not_found unless the conversation is the caller's. Deleting does not reset the hourly question limit.",
+    "fullPath": "/api/core/assistant/conversations/:id"
+  },
+  {
+    "id": "assistant.conversations.get",
+    "service": "core",
+    "method": "GET",
+    "path": "/assistant/conversations/:id",
+    "roles": [
+      "authenticated"
+    ],
+    "summary": "The caller's conversation with the help assistant: questions and answers, oldest first",
+    "response": "AssistantConversation",
+    "notes": "Only the person's messages and the assistant's answers; tool steps and thinking are never returned. 404 conversation_not_found unless the conversation is the caller's.",
+    "fullPath": "/api/core/assistant/conversations/:id"
+  },
+  {
+    "id": "assistant.messages.send",
+    "service": "core",
+    "method": "POST",
+    "path": "/assistant/messages",
+    "roles": [
+      "authenticated"
+    ],
+    "summary": "Ask the help assistant a question, in a new or an existing conversation",
+    "request": "AssistantMessageRequest",
+    "response": "AssistantReply",
+    "notes": "Claude (toolTurn, low effort, at most 6 tool rounds) with read-only tools over the caller's own data, chosen by role. History is stored exactly as returned and replayed unchanged (append-only); the role, page, language and date go in the user message, never the system prompt. 400 empty_message / message_too_long (2000 characters). 404 conversation_not_found unless the conversation is the caller's. 409 conversation_full after 20 questions; 409 conversation_busy when two messages race on one conversation. 429 ai_rate_limited after AI_ASSISTANT_HOURLY_LIMIT questions in an hour. 503 ai_unavailable when AI is turned off or the model cannot be reached; suggest the support team instead. `handoff` is true when the assistant suggests a person; the frontend then offers to send the transcript as a support ticket.",
+    "fullPath": "/api/core/assistant/messages"
+  },
+  {
+    "id": "authoring.assist",
+    "service": "core",
+    "method": "POST",
+    "path": "/authoring/assist",
+    "roles": [
+      "pillar_rep",
+      "executive_admin"
+    ],
+    "summary": "Writing assistant: an AI draft of a course outline, a reading lesson or quiz questions. Nothing is saved.",
+    "srs": [
+      "FR-A2.14"
+    ],
+    "request": "AssistRequest",
+    "response": "AssistResult",
+    "query": [
+      "pillar?: PillarId (executive_admin only)"
+    ],
+    "notes": "Runs without a database transaction (it waits for Claude, effort medium). Written in the course's first language. outline: 3 to 6 modules, each ending with a quiz lesson, minutes 1 to 240. reading: { intro, sections[{ heading, body?, list? }] }. quiz: count questions with server-generated ids, answers within the options, true_false options [\"True\", \"False\"], short questions with guidance. 400 invalid_task, title_required, lesson_title_required, invalid_count. 429 ai_rate_limited after AI_AUTHORING_HOURLY_LIMIT drafts per person per hour (default 40). 422 ai_declined when the model declines. 503 ai_unavailable \"The writing assistant is not available right now\" when AI is off or failing. Only usage is logged; the course is not read or written.",
+    "fullPath": "/api/core/authoring/assist"
+  },
+  {
     "id": "authoring.context.get",
     "service": "core",
     "method": "GET",
@@ -1782,13 +1843,14 @@
     "roles": [
       "judge_mentor"
     ],
-    "summary": "Short-lived pre-signed MinIO link to a redacted entry document",
+    "summary": "Short-lived pre-signed link to the anonymised copy of an entry document",
     "srs": [
+      "FR-B2.2",
       "FR-B2.3",
       "NFR-SEC.9"
     ],
     "response": "DocumentLink",
-    "notes": "Serve the redacted copy only (names, logos and contact details removed). URL expires after 5 minutes. 409 scan_pending while the virus scan has not passed.",
+    "notes": "Serves the anonymised copy only, never the upload: a PDF rendered after submission with names, contact details, links and other identifying details replaced by [REDACTED] (Claude, then a deterministic pass over the entry's known names). Opened inline in the page viewer; the URL expires after 5 minutes. 409 redaction_pending while the copy is being prepared; 409 redaction_unavailable when there is none.",
     "fullPath": "/api/core/judging/entries/:code/documents/:kind"
   },
   {
@@ -1824,7 +1886,7 @@
       "NFR-SEC.9"
     ],
     "response": "GradingEntry",
-    "notes": "404 not_assigned unless the entry is routed to the caller and not recused. Response must contain no personal data: no names, team, photos, emails, phones or original file names (NFR-SEC.9).",
+    "notes": "404 not_assigned unless the entry is routed to the caller and not recused. Response must contain no personal data: no names, team, photos, emails, phones or original file names (NFR-SEC.9). `documents` lists the entry's current files that passed the virus scan (none for an entry without files), each with the `status` of its anonymised copy: ready, pending (being prepared) or unavailable (AI turned off, three failed attempts, or the original is missing).",
     "fullPath": "/api/core/judging/entries/:code"
   },
   {
@@ -2060,7 +2122,7 @@
       "NFR-BW.3"
     ],
     "response": "LessonContent",
-    "notes": "Enrolled learners only (403 \"not_enrolled\"). Video and PDF URLs are short-lived signed /media links to MinIO. Offer 360p, 480p and 720p renditions.",
+    "notes": "Enrolled learners only (403 \"not_enrolled\"). Video and PDF URLs are short-lived signed /media links to MinIO. Offer 360p, 480p and 720p renditions. Reading lessons return the text written in the course editor, or a generic text when none was written.",
     "fullPath": "/api/core/lms/courses/:courseId/lessons/:lessonId"
   },
   {
@@ -2098,6 +2160,22 @@
     "response": "CoursePlayer",
     "notes": "404 \"course_not_found\" for unknown slugs. Unpublished courses stay readable for learners already enrolled.",
     "fullPath": "/api/core/lms/player/:slug"
+  },
+  {
+    "id": "lms.quizzes.feedback",
+    "service": "core",
+    "method": "GET",
+    "path": "/lms/courses/:courseId/quizzes/:lessonId/feedback",
+    "roles": [
+      "beneficiary"
+    ],
+    "summary": "Feedback on the short answers of the learner's latest attempt: the AI suggestion, or the review once a Pillar Representative saved one",
+    "srs": [
+      "FR-A2.6"
+    ],
+    "response": "ShortAnswerFeedback[]",
+    "notes": "Empty before the first attempt. After a submit with feedbackStatus \"pending\", poll every 2 seconds until no item is pending. The AI gets the question, marking guidance and answer only, never the learner's name or contact details, and writes in the learner's language (account language, else Accept-Language).",
+    "fullPath": "/api/core/lms/courses/:courseId/quizzes/:lessonId/feedback"
   },
   {
     "id": "lms.quizzes.get",
@@ -2600,6 +2678,52 @@
     ],
     "notes": "Changing the email or phone sends a new verification code before it takes effect. 400 \"invalid_name\" for an empty name.",
     "fullPath": "/api/core/profile/me"
+  },
+  {
+    "id": "reviews.list",
+    "service": "core",
+    "method": "GET",
+    "path": "/lms/reviews",
+    "paginated": true,
+    "roles": [
+      "pillar_rep",
+      "executive_admin"
+    ],
+    "summary": "Short quiz answers of the caller's pillar with the AI suggestion and any saved review",
+    "srs": [
+      "FR-A2.6"
+    ],
+    "response": "Page<ReviewItem>",
+    "query": [
+      "status?: \"pending\" | \"reviewed\" | \"all\" (default pending)",
+      "courseId?: string",
+      "page?: number",
+      "pageSize?: number (default 20, max 100)",
+      "pillar?: PillarId (executive_admin only)"
+    ],
+    "notes": "RLS: pillar_rep only sees lms.short_answer_reviews rows of their pillar; executive_admin sees all, or one pillar with ?pillar=. Pending oldest first, reviewed newest review first, all newest submission first. learnerName is the only learner detail returned.",
+    "fullPath": "/api/core/lms/reviews"
+  },
+  {
+    "id": "reviews.save",
+    "service": "core",
+    "method": "POST",
+    "path": "/lms/reviews/:id",
+    "roles": [
+      "pillar_rep",
+      "executive_admin"
+    ],
+    "summary": "Confirm or rewrite the feedback on a short answer; the learner is notified",
+    "srs": [
+      "FR-A2.6"
+    ],
+    "request": "ReviewInput",
+    "response": "ReviewItem",
+    "emits": [
+      "short_answer.reviewed"
+    ],
+    "notes": "400 invalid_verdict, feedback_required, feedback_too_long (1000). 404 review_not_found, also for another pillar's answer. Saving again replaces the earlier review; the learner is notified (\"Your answer was reviewed\", link /app/learn/<slug>) and the audit log records \"Reviewed short answer\" only when the verdict or text changed.",
+    "fullPath": "/api/core/lms/reviews/:id"
   },
   {
     "id": "schedule.sessions.join",
