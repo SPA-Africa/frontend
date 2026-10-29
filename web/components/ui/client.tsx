@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Moon, Sun, X } from 'lucide-react';
 import { cx } from '@/lib/format';
 import { useT } from '@/lib/i18n';
@@ -90,7 +91,10 @@ export function Modal({ open, onClose, title, children, footer, wide }: { open: 
   }, [open, onClose]);
   const t = useT();
   if (!open) return null;
-  return (
+  // Portaled to <body>: ancestors with transform/filter animations (e.g. the portal
+  // shell's fade-in wrapper) would otherwise become the containing block for
+  // position:fixed and break viewport centering.
+  return createPortal(
     <div className="fixed inset-0 z-[200] flex items-end justify-center p-0 sm:items-center sm:p-6" role="dialog" aria-modal="true" aria-label={title}>
       <div className="fade-in absolute inset-0 bg-black/40 backdrop-blur-[2px]" onClick={onClose} />
       <div className={cx('fade-in relative max-h-[92vh] w-full overflow-auto rounded-t-3xl bg-bg p-6 shadow-2xl sm:rounded-3xl sm:p-8', wide ? 'sm:max-w-3xl' : 'sm:max-w-lg')}>
@@ -101,7 +105,8 @@ export function Modal({ open, onClose, title, children, footer, wide }: { open: 
         {children}
         {footer && <div className="mt-8 flex flex-wrap justify-end gap-2">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -113,8 +118,9 @@ export function useToast() {
     const t = setTimeout(() => setMsg(null), 3200);
     return () => clearTimeout(t);
   }, [msg]);
-  const node = msg ? (
-    <div role="status" className="fade-in fixed bottom-6 left-1/2 z-[300] -translate-x-1/2 rounded-full bg-ink px-5 py-3 text-sm font-semibold text-bg shadow-xl">{msg}</div>
+  const node = msg ? createPortal(
+    <div role="status" className="fade-in fixed bottom-6 left-1/2 z-[300] -translate-x-1/2 rounded-full bg-ink px-5 py-3 text-sm font-semibold text-bg shadow-xl">{msg}</div>,
+    document.body,
   ) : null;
   return { toast: setMsg, toastNode: node };
 }

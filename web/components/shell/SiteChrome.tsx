@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useEffect, useRef, useState } from 'react';
-import { ArrowUp, Languages } from 'lucide-react';
+import { ArrowUp, Languages, Mail, Phone } from 'lucide-react';
 import { Button, Logo } from '@/components/ui';
 import { ThemeToggle } from '@/components/ui/client';
 import { homeFor, useSession } from '@/lib/session';
@@ -130,6 +130,16 @@ export function SiteFooter() {
         <div>
           <Logo />
           <p className="mt-3 text-muted">{t('site.footer.tagline')}</p>
+          <div className="mt-5 flex flex-col gap-2.5">
+            <a href="mailto:shapepotential@gmail.com" className="inline-flex items-center gap-2.5 text-[15px] font-semibold text-muted transition hover:text-brand">
+              <Mail size={18} className="shrink-0 text-brand" />
+              shapepotential@gmail.com
+            </a>
+            <a href="tel:+250796060684" className="inline-flex items-center gap-2.5 text-[15px] font-semibold text-muted transition hover:text-brand">
+              <Phone size={18} className="shrink-0 text-brand" />
+              +250 796 060 684
+            </a>
+          </div>
         </div>
         <div className="grid grid-cols-2 gap-x-14 gap-y-2 text-[15px] font-semibold text-muted sm:grid-cols-3">
           <Link href="/#about" className="hover:text-ink">{t('site.nav.about')}</Link>

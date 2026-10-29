@@ -87,6 +87,38 @@ html[data-motion="reduce"] *, html[data-motion="reduce"] *::before, html[data-mo
   .grid { grid-template-columns: minmax(0, 1fr); }
 }
 
+/* ---------- styled native select picker ----------
+   Chromium 135+ lets the dropdown list opt out of OS styling; other
+   browsers ignore this block and keep their native picker. */
+@supports (appearance: base-select) {
+  select,
+  select::picker(select) { appearance: base-select; }
+  /* base-select adds a UA arrow and its own box layout; keep the component's
+     chevron and alignment instead */
+  select { display: flex; align-items: center; }
+  select::picker-icon { display: none; }
+  select::picker(select) {
+    margin-block-start: 6px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--bg);
+    padding: 6px;
+    box-shadow: 0 16px 40px rgb(0 0 0 / 0.16);
+  }
+  select option {
+    padding: 10px 12px;
+    border-radius: 9px;
+    font-size: 15px;
+    color: var(--ink);
+    transition: background-color .15s;
+  }
+  select option:hover,
+  select option:focus-visible { background: var(--surface); }
+  select option:checked { color: #cb3302; font-weight: 600; }
+  select option:disabled { color: var(--subtle); }
+  select option::checkmark { display: none; }
+}
+
 /* ---------- small motion helpers ---------- */
 @layer utilities {
   .reveal { opacity: 0; transform: translateY(24px); transition: opacity .8s var(--ease-out-soft), transform .8s var(--ease-out-soft); }
